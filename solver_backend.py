@@ -1,9 +1,12 @@
 import cv2
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import load_model
-import sympy
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
+import sympy as sp
 
 # --- CONFIGURATION ---
+IMG_SIZE = 28
 CLASS_MAP = {
     '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
     '+': 10, '-': 11, '=': 12, 'times': 13, 'div': 14, '/': 15, '.': 16, 'pm': 17,
@@ -21,176 +24,271 @@ CLASS_MAP = {
 ID_TO_LABEL = {v: k for k, v in CLASS_MAP.items()}
 
 class EquationSolver:
-    def __init__(self, model_path='math_cnn.h5'):
+    def __init__(self, model_path='math_cnn_v2_optimized.h5'):
         try:
             self.model = load_model(model_path)
             self.model_loaded = True
-        except:
+            print(f"✅ Model loaded from {model_path}")
+        except Exception as e:
             self.model_loaded = False
-
-    def pad_to_square(self, img, padding=4):
-        """Pads crop to square to preserve aspect ratio (CRITICAL for digit recognition)"""
-        h, w = img.shape
-        diff = abs(h - w)
-        pad1, pad2 = diff // 2, diff - (diff // 2)
-        
-        if h > w:
-            padded = cv2.copyMakeBorder(img, 0, 0, pad1 + padding, pad2 + padding, cv2.BORDER_CONSTANT, value=0)
-        else:
-            padded = cv2.copyMakeBorder(img, pad1 + padding, pad2 + padding, 0, 0, cv2.BORDER_CONSTANT, value=0)
-            
-        return padded
+            print(f"❌ Failed to load model: {e}")
 
     def preprocess_image(self, img):
         """
-        Aggressive cleanup pipeline for high-res phone photos.
-        1. Downscale: Reduces paper grain visibility.
-        2. Bilateral Filter: Blurs noise but keeps edges (ink) sharp.
-        3. Morphological Open: Deletes tiny specks.
+        1. Downscale (for speed/consistency).
+        2. Denoise.
+        3. Threshold.
+        4. Deskew (Straighten).
         """
-        # 1. Convert to Grayscale
+        # Convert to Grayscale
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         else:
             gray = img
 
-        # 2. INTELLIGENT RESIZE (The most important step)
-        # High-res (4000px) images capture too much texture. 
-        # We resize to a fixed height (e.g., 800px) to standardize density.
+        # 1. INTELLIGENT RESIZE
+        # Standardize height to 800px to make kernel sizes consistent
         h, w = gray.shape
         target_height = 800
         scale = target_height / h
         new_w = int(w * scale)
         resized = cv2.resize(gray, (new_w, target_height))
 
-        # 3. Denoising (Bilateral is better than Gaussian)
-        # It smooths flat areas (paper) but preserves edges (ink).
-        # d=9, sigmaColor=75, sigmaSpace=75 are standard strong settings.
+        # 2. Denoise (Bilateral is best for preserving edges)
         denoised = cv2.bilateralFilter(resized, 9, 75, 75)
 
-        # 4. Adaptive Thresholding (Optimized for Paper)
-        # blockSize=41 (Large area) -> Ignores small grain, looks at general lighting
-        # C=15 (High constant) -> Forces background to be strictly white
+        # 3. Adaptive Thresholding
         binary = cv2.adaptiveThreshold(
             denoised, 255, 
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 
-            blockSize=41, # Large block size ignores texture
+            blockSize=41, 
             C=15
         )
 
-        # 5. Morphological "Opening" (Erosion -> Dilation)
-        # This eats away small "salt" noise (single pixels) then grows the ink back.
+        # 4. Morphological Cleanup (Remove tiny noise)
         kernel = np.ones((3,3), np.uint8)
         clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # 6. Dilation (Thicken lines)
-        # Phone photos often have thin strokes. We thicken them to look like MNIST data.
-        thick = cv2.dilate(clean, kernel, iterations=1)
+        # 5. Deskew (Straighten the text)
+        coords = np.column_stack(np.where(clean > 0))
+        if len(coords) == 0: return clean, 1.0 # Empty image
+        
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45: angle = -(90 + angle)
+        else: angle = -angle
+        
+        (h, w) = clean.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(clean, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        
+        return rotated, scale
 
-        return thick, scale # Return scale so we can map boxes back to original if needed
+    def find_and_filter_contours(self, binary_img):
+        """
+        Finds contours, merges vertical stacks (like = or :), filters noise.
+        """
+        contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = [cv2.boundingRect(c) for c in contours]
+        
+        if not boxes: return []
 
-    def solve_image(self, image_buffer):
-        if not self.model_loaded:
-            return None, "Model not found", "N/A"
-
-        file_bytes = np.asarray(bytearray(image_buffer.read()), dtype=np.uint8)
-        original = cv2.imdecode(file_bytes, 1)
-        
-        # --- CALL NEW PREPROCESSOR ---
-        thresh, scale = self.preprocess_image(original)
-        
-        # Find Contours on the PROCESSED (small) image
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filter Noise: Ignore tiny blobs relative to the new size
-        # Area < 50 pixels in an 800px high image is definitely dust
-        valid_contours = [c for c in contours if cv2.contourArea(c) > 50]
-        
-        boxes = [cv2.boundingRect(c) for c in valid_contours]
-        boxes = sorted(boxes, key=lambda b: b[0])
-        
-        # ... [Keep your existing "Merge Overlaps" logic here] ...
-        # (Copy-paste the merge loop from the previous step)
-        merged_boxes = []
-        skip_indices = set()
-        for i in range(len(boxes)):
-            if i in skip_indices: continue
-            x1, y1, w1, h1 = boxes[i]
+        # --- MERGE LOGIC (Recursive) ---
+        while True:
             merged = False
-            for j in range(i + 1, len(boxes)):
-                if j in skip_indices: continue
-                x2, y2, w2, h2 = boxes[j]
-                x_overlap = max(0, min(x1+w1, x2+w2) - max(x1, x2))
-                # Slightly looser check for resized image
-                if x_overlap > 0 or abs(x1 - x2) < 10: 
-                    new_x = min(x1, x2)
-                    new_y = min(y1, y2)
-                    new_w = max(x1+w1, x2+w2) - new_x
-                    new_h = max(y1+h1, y2+h2) - new_y
-                    merged_boxes.append((new_x, new_y, new_w, new_h))
-                    skip_indices.add(j)
-                    merged = True
-                    break
-            if not merged: merged_boxes.append((x1, y1, w1, h1))
-        # ... [End Merge Logic] ...
+            new_boxes = []
+            skip_indices = set()
+            boxes.sort(key=lambda b: b[0]) # Sort by X
 
-        batch_images = []
-        final_boxes = [] # Boxes on the resized image
+            for i in range(len(boxes)):
+                if i in skip_indices: continue
+                x1, y1, w1, h1 = boxes[i]
+                merged_this_iter = False
+
+                for j in range(i + 1, len(boxes)):
+                    if j in skip_indices: continue
+                    x2, y2, w2, h2 = boxes[j]
+
+                    # Overlap Checks
+                    xi1 = max(x1, x2)
+                    yi1 = max(y1, y2)
+                    xi2 = min(x1 + w1, x2 + w2)
+                    yi2 = min(y1 + h1, y2 + h2)
+                    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+                    area1 = w1 * h1
+                    area2 = w2 * h2
+                    
+                    overlap_ratio = inter_area / min(area1, area2) if min(area1, area2) > 0 else 0
+                    
+                    # Vertical Stacking Check (share X-space, close Y)
+                    x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+                    is_stacked = (x_overlap > 0.4 * min(w1, w2)) 
+                    
+                    if overlap_ratio > 0.5 or is_stacked:
+                        nx = min(x1, x2)
+                        ny = min(y1, y2)
+                        nw = max(x1 + w1, x2 + w2) - nx
+                        nh = max(y1 + h1, y2 + h2) - ny
+                        new_boxes.append((nx, ny, nw, nh))
+                        skip_indices.add(j)
+                        merged = True
+                        merged_this_iter = True
+                        break 
+                
+                if not merged_this_iter:
+                    new_boxes.append(boxes[i])
+            
+            boxes = new_boxes
+            if not merged: break
         
-        for (x, y, w, h) in merged_boxes:
-            # Aspect ratio check
-            if w > 4*h: continue 
-            
-            # Crop from the PROCESSED image (thresh), not original
-            crop = thresh[y:y+h, x:x+w]
-            
-            square = self.pad_to_square(crop, padding=6)
-            final = cv2.resize(square, (28, 28))
-            final_norm = final.astype('float32') / 255.0
-            batch_images.append(final_norm)
-            final_boxes.append((x, y, w, h))
+        # --- FILTER NOISE ---
+        if not boxes: return []
+        areas = [b[2] * b[3] for b in boxes]
+        median_area = np.median(areas)
+        final_boxes = [b for b in boxes if (b[2]*b[3]) > median_area / 5]
+        
+        # Sort left-to-right
+        final_boxes.sort(key=lambda b: b[0])
+        return final_boxes
 
-        if not batch_images:
-            return original, "No symbols detected", "Error"
+    def extract_and_predict(self, binary_img, boxes):
+        batch_images = []
+        if not boxes: return []
 
-        # Predict
-        batch_input = np.array(batch_images).reshape(-1, 28, 28, 1)
+        for (x, y, w, h) in boxes:
+            # ROI
+            roi = binary_img[y:y+h, x:x+w]
+            
+            # Pad to Square
+            max_dim = max(w, h)
+            pad_w = (max_dim - w) // 2
+            pad_h = (max_dim - h) // 2
+            # Add extra padding (6px) to match MNIST-style training
+            roi = cv2.copyMakeBorder(roi, pad_h+4, pad_h+4, pad_w+4, pad_w+4, cv2.BORDER_CONSTANT, value=0)
+            
+            # Resize
+            roi = cv2.resize(roi, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+            
+            # Normalize
+            roi = roi.astype('float32') / 255.0
+            roi = np.expand_dims(roi, axis=-1)
+            batch_images.append(roi)
+
+        batch_input = np.array(batch_images)
         probs = self.model.predict(batch_input, verbose=0)
         preds = np.argmax(probs, axis=1)
         labels = [ID_TO_LABEL[p] for p in preds]
+        return labels
 
-        # Parse & Solve (Keep existing logic)
-        equation_str = ""
-        for l in labels:
-            if l == 'times' or l == 'x' or l == 'X': equation_str += '*'
-            elif l == 'div': equation_str += '/'
-            elif l in ['plus', 'add']: equation_str += '+'
-            elif l in ['minus', 'sub']: equation_str += '-'
-            elif l in ['=', 'eq', 'equal']: continue
-            else: equation_str += l
-            
-        try:
-            result = sympy.sympify(equation_str)
-            if hasattr(result, 'is_integer') and result.is_integer: result = int(result)
-        except: result = "Error"
-
-        # --- VISUALIZATION ON ORIGINAL IMAGE ---
-        # We must map the small boxes back to the huge original image
-        display_img = original.copy()
-        inverse_scale = 1 / scale
+    def disambiguate_symbols(self, labels, boxes):
+        """Distinguish between 'x' (variable) and 'times' (multiply)"""
+        refined = list(labels)
+        if len(boxes) < 2: return refined
         
-        for i, (x, y, w, h) in enumerate(final_boxes):
-            # Scale coordinates back up
-            orig_x = int(x * inverse_scale)
-            orig_y = int(y * inverse_scale)
-            orig_w = int(w * inverse_scale)
-            orig_h = int(h * inverse_scale)
+        avg_height = np.median([b[3] for b in boxes])
+
+        for i in range(len(refined)):
+            lbl = refined[i]
+            if lbl not in ['x', 'times', 'X']: continue
             
-            cv2.rectangle(display_img, (orig_x, orig_y), (orig_x+orig_w, orig_y+orig_h), (0, 200, 0), 5)
-            # Make font huge for high-res images
-            font_scale = 2.0 if original.shape[0] > 2000 else 1.0
-            cv2.putText(display_img, labels[i], (orig_x, orig_y-10), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), 3)
+            _, y, _, h = boxes[i]
+            
+            # Logic: Multiplications are usually smaller OR floating
+            is_small = h < (0.75 * avg_height)
+            
+            # Check neighbors for floating status
+            neighbor = boxes[i-1] if i > 0 else (boxes[i+1] if i+1 < len(boxes) else None)
+            is_floating = False
+            if neighbor:
+                _, ny, _, nh = neighbor
+                if (y + h) < (ny + nh - 0.2 * nh): # Bottom is significantly higher
+                    is_floating = True
 
-        return display_img, equation_str, result
+            if is_small or is_floating:
+                refined[i] = 'times'
+            else:
+                refined[i] = 'x'
+        return refined
 
+    def parse_and_solve(self, labels):
+        map_op = {
+            'times': '*', 'div': '/', 'plus': '+', '-': '-', 'pm': '+', 
+            '=': '=', 'x': 'x', 'y': 'y', 'z': 'z', 'pi': 'pi',
+            'sin': 'sin', 'cos': 'cos', 'tan': 'tan', 'sqrt': 'sqrt'
+        }
+        
+        eq_str = ""
+        for lbl in labels:
+            eq_str += map_op.get(lbl, lbl)
+            
+        # Handle trailing "="
+        if eq_str.endswith('='): eq_str = eq_str[:-1]
+        
+        print(f"Solving: {eq_str}")
+        
+        transformations = (standard_transformations + (implicit_multiplication_application,))
+        
+        try:
+            if '=' not in eq_str:
+                expr = parse_expr(eq_str, transformations=transformations)
+                res = float(expr)
+                if res.is_integer(): res = int(res)
+                return eq_str, f"{res}"
+            else:
+                parts = eq_str.split('=')
+                if len(parts) != 2: return eq_str, "Error: Multiple '='"
+                lhs_str, rhs_str = parts
+                
+                if not rhs_str.strip(): # Case "2+2="
+                    expr = parse_expr(lhs_str, transformations=transformations)
+                    return lhs_str, f"{float(expr)}"
+
+                lhs = parse_expr(lhs_str, transformations=transformations)
+                rhs = parse_expr(rhs_str, transformations=transformations)
+                
+                # Solve for x (or first symbol)
+                syms = lhs.free_symbols.union(rhs.free_symbols)
+                if not syms:
+                    return eq_str, str(sp.simplify(lhs - rhs) == 0)
+                
+                target = list(syms)[0]
+                sol = sp.solve(lhs - rhs, target)
+                return eq_str, f"{target} = {sol}"
+                
+        except Exception as e:
+            return eq_str, f"Math Error: {str(e)}"
+
+    def solve_image(self, image_buffer):
+        """Main Pipeline"""
+        if not self.model_loaded:
+            return None, "Model Error", "Check .h5 file"
+
+        # Read Image
+        file_bytes = np.asarray(bytearray(image_buffer.read()), dtype=np.uint8)
+        original = cv2.imdecode(file_bytes, 1)
+        
+        # 1. Preprocess (Deskew)
+        processed, scale = self.preprocess_image(original)
+        
+        # 2. Segment
+        boxes = self.find_and_filter_contours(processed)
+        if not boxes:
+            return processed, "No Content", "Empty"
+            
+        # 3. Predict
+        labels = self.extract_and_predict(processed, boxes)
+        
+        # 4. Disambiguate
+        labels = self.disambiguate_symbols(labels, boxes)
+        
+        # 5. Solve
+        final_eq, result = self.parse_and_solve(labels)
+        
+        # 6. Visualize (Draw on the DESKEWED image)
+        vis_img = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+        for i, (x, y, w, h) in enumerate(boxes):
+            cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(vis_img, labels[i], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        return vis_img, final_eq, result
