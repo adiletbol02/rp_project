@@ -24,13 +24,14 @@ CLASS_MAP = {
 ID_TO_LABEL = {v: k for k, v in CLASS_MAP.items()}
 
 class EquationSolver:
-    def __init__(self, model_path):
-        print(f"Loading model from {model_path}...")
+    def __init__(self, model_path='math_cnn_v2_optimized.h5'):
         try:
             self.model = load_model(model_path)
-            print("Model loaded successfully.")
+            self.model_loaded = True
+            print(f"✅ Model loaded from {model_path}")
         except Exception as e:
-            print(f"Error loading model: {e}")
+            self.model_loaded = False
+            print(f"❌ Failed to load model: {e}")
 
     def preprocess_image(self, img_input, debug_dir=None):
         """
@@ -395,5 +396,6 @@ class EquationSolver:
             cv2.imwrite(f"{debug_dir}/8_final_result.png", vis_img)
         
         return solution_text
+
 
 
