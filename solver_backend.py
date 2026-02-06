@@ -184,9 +184,12 @@ class EquationSolver:
         
         return [ID_TO_LABEL[idx] for idx in pred_indices]
 
-    def disambiguate_symbols(self, labels, boxes):
+        def disambiguate_symbols(self, labels, boxes):
         """
-        New Robust Logic: Context Groups
+        Strict Contextual Disambiguation Logic:
+        - Math operators are the PRIMARY driver for disambiguation
+        - Shape/height heuristics are secondary fallbacks
+        - Resolves ambiguities: x/times, 5/s, 1/l/|, 0/o
         """
         if len(boxes) < 1: return labels
         refined = list(labels)
@@ -196,6 +199,9 @@ class EquationSolver:
         avg_height = np.median(heights)
         centroids_y = [(b[1] + b[3] / 2) for b in boxes]
 
+        # Define math operator set for context checking
+        math_operators = ['+', '-', '=', '*', '/', 'times', 'div', 'pm']
+
         for i in range(len(refined)):
             lbl = refined[i]
             x, y, w, h = boxes[i]
@@ -203,37 +209,80 @@ class EquationSolver:
             prev_lbl = refined[i-1] if i > 0 else None
             next_lbl = refined[i+1] if i < len(refined) - 1 else None
             
-            # 1. 'x' vs 'times'
+            # Context flags (computed once per iteration)
+            prev_is_op = prev_lbl in math_operators if prev_lbl else False
+            next_is_op = next_lbl in math_operators if next_lbl else False
+            prev_is_digit = prev_lbl and prev_lbl.isdigit() if prev_lbl else False
+            next_is_digit = next_lbl and next_lbl.isdigit() if next_lbl else False
+            digit_context = prev_is_digit or next_is_digit
+            
+            # 1. 'x' vs 'times' (multiplication)
+            # RULE: If x is next to a math operator, it is a VARIABLE
             if lbl in ['x', 'times', 'X']:
-                is_between_nums = (prev_lbl and prev_lbl.isdigit()) and (next_lbl and next_lbl.isdigit())
-                is_small = h < (0.85 * avg_height)
-                is_floating = False
-                if prev_lbl or next_lbl:
-                    neighbor_cy = centroids_y[i-1] if prev_lbl else centroids_y[i+1]
-                    if cy < (neighbor_cy - 0.1 * h): is_floating = True
-
-                if is_between_nums or is_small or is_floating:
-                    refined[i] = 'times'
-                else:
+                if prev_is_op or next_is_op:
+                    # Math context → x is a variable
                     refined[i] = 'x'
+                else:
+                    # No operator context, check other heuristics
+                    is_between_nums = prev_is_digit and next_is_digit
+                    is_small = h < (0.85 * avg_height)
+                    is_floating = False
+                    if prev_lbl or next_lbl:
+                        neighbor_cy = centroids_y[i-1] if prev_lbl else centroids_y[i+1]
+                        if cy < (neighbor_cy - 0.1 * h): 
+                            is_floating = True
 
-            # 2. '5' vs 's'
+                    if is_between_nums or is_small or is_floating:
+                        refined[i] = 'times'
+                    else:
+                        refined[i] = 'x'
+
+            # 2. '5' vs 's' / 'S'
+            # RULE: If '5' is next to a math operator or digit, it is a DIGIT
             elif lbl in ['5', 's', 'S']:
-                is_trig = (next_lbl in ['i', 'I']) or (prev_lbl in ['o', 'O', 'c', 'C'])
-                is_math = (prev_lbl in ['+', '-', '=']) or (next_lbl in ['+', '-', '='])
-                if is_trig: refined[i] = 's'
-                elif is_math: refined[i] = '5'
+                if prev_is_op or next_is_op or digit_context:
+                    # Math/digit context → treat as digit '5'
+                    refined[i] = '5'
+                else:
+                    # Check for variable context (sin, cos, etc.)
+                    is_trig = (next_lbl in ['i', 'I']) or (prev_lbl in ['o', 'O', 'c', 'C'])
+                    is_math = (prev_lbl in ['+', '-', '=']) or (next_lbl in ['+', '-', '='])
+                    if is_trig: 
+                        refined[i] = 's'
+                    elif is_math: 
+                        refined[i] = '5'
+                    else:
+                        # Default: treat as '5' if uncertain
+                        refined[i] = '5'
 
-            # 3. '1' vs 'l' vs '|'
+            # 3. '1' vs 'l' vs 'I' vs '|'
+            # RULE: If next to digit/operator, prefer '1'; if in variable context, prefer 'l'
             elif lbl in ['1', 'l', '|', 'I', 'i']:
-                if h > 1.4 * avg_height: refined[i] = '|'
-                elif next_lbl in ['n', 'N', 'o', 'O']: refined[i] = 'l'
-                else: refined[i] = '1'
+                if digit_context or prev_is_op or next_is_op:
+                    # Digit/math context → '1' is most likely
+                    refined[i] = '1'
+                elif h > 1.4 * avg_height:
+                    # Very tall → vertical bar '|'
+                    refined[i] = '|'
+                elif next_lbl in ['n', 'N', 'o', 'O']:
+                    # Word context (e.g., "in", "on") → 'l'
+                    refined[i] = 'l'
+                else:
+                    # Default: '1'
+                    refined[i] = '1'
 
             # 4. '0' vs 'o'
+            # RULE: If next to digit/operator, prefer '0'; if in variable context, prefer 'o'
             elif lbl in ['0', 'o', 'O']:
-                if prev_lbl in ['c', 'C', 'l', 'L']: refined[i] = 'o'
-                elif (prev_lbl and prev_lbl.isdigit()) or (next_lbl and next_lbl.isdigit()): refined[i] = '0'
+                if digit_context or prev_is_op or next_is_op:
+                    # Digit/math context → '0'
+                    refined[i] = '0'
+                elif prev_lbl in ['c', 'C', 'l', 'L']:
+                    # Letter context (e.g., "co", "lo") → 'o'
+                    refined[i] = 'o'
+                else:
+                    # Default: '0' (more common in equations)
+                    refined[i] = '0'
 
         return refined
 
@@ -319,3 +368,4 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
+
