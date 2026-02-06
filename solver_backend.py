@@ -56,15 +56,15 @@ class EquationSolver:
         img_resized = cv2.resize(img, (new_w, target_height))
 
         # 2. DENOISE (Bilateral)
-        denoised = cv2.bilateralFilter(img_resized, 9, 75, 75)
+        denoised = cv2.bilateralFilter(img_resized, 27, 75, 75)
 
         # 3. THRESHOLDING (The Fix for Hollow Strokes)
         # BlockSize 51, C 15 ensures thick pen strokes don't turn white inside
         binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 51, 15)
+                                       cv2.THRESH_BINARY_INV, 75, 17)
 
         # 4. MORPHOLOGICAL CLEANUP
-        kernel = np.ones((2, 2), np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
         clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
         # 5. DESKEWING
@@ -362,6 +362,7 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
+
 
 
 
