@@ -67,7 +67,7 @@ class EquationSolver:
         )
 
         # 4. Morphological Cleanup (Remove tiny noise)
-        kernel = np.ones((3,3), np.uint8)
+        kernel = np.ones((2,2), np.uint8)
         clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
         
         # 5. Deskew (Straighten the text)
@@ -86,9 +86,6 @@ class EquationSolver:
         return rotated, scale
 
     def find_and_filter_contours(self, binary_img):
-        """
-        Finds contours, merges vertical stacks (like = or :), filters noise.
-        """
         contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         boxes = [cv2.boundingRect(c) for c in contours]
         
@@ -142,13 +139,25 @@ class EquationSolver:
             boxes = new_boxes
             if not merged: break
         
-        # --- FILTER NOISE ---
+        # --- FIX: SMARTER FILTERING ---
         if not boxes: return []
         areas = [b[2] * b[3] for b in boxes]
         median_area = np.median(areas)
-        final_boxes = [b for b in boxes if (b[2]*b[3]) > median_area / 5]
         
-        # Sort left-to-right
+        final_boxes = []
+        for b in boxes:
+            w, h = b[2], b[3]
+            area = w * h
+            
+            # EXCEPTION: Keep it if it looks like a minus sign
+            # Condition: Width is at least 2.5x Height (Wide and Short)
+            # AND it's not microscopic (at least 1/15th of median)
+            is_minus_like = (w > 2.5 * h) and (area > median_area / 15)
+            
+            # Keep if standard size OR if it's a minus sign
+            if (area > median_area / 5) or is_minus_like:
+                final_boxes.append(b)
+        
         final_boxes.sort(key=lambda b: b[0])
         return final_boxes
 
@@ -292,3 +301,4 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
+
