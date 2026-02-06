@@ -24,79 +24,99 @@ CLASS_MAP = {
 ID_TO_LABEL = {v: k for k, v in CLASS_MAP.items()}
 
 class EquationSolver:
-    def __init__(self, model_path='math_cnn_v2_optimized.h5'):
+    def __init__(self, model_path):
+        print(f"Loading model from {model_path}...")
         try:
             self.model = load_model(model_path)
-            self.model_loaded = True
-            print(f"✅ Model loaded from {model_path}")
+            print("Model loaded successfully.")
         except Exception as e:
-            self.model_loaded = False
-            print(f"❌ Failed to load model: {e}")
+            print(f"Error loading model: {e}")
 
-    def preprocess_image(self, img):
+    def preprocess_image(self, img_input, debug_dir=None):
         """
-        1. Downscale (for speed/consistency).
-        2. Denoise.
-        3. Threshold.
-        4. Deskew (Straighten).
+        ROBUST UPDATES:
+        1. Resize to fixed height (800px) for consistent kernel behavior.
+        2. Bilateral Filter (keeps edges sharp, removes noise).
+        3. Morphological Cleanup (removes tiny dots).
         """
-        # Convert to Grayscale
-        if len(img.shape) == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Handle input: if string, load path. If array, use directly.
+        if isinstance(img_input, str):
+            img = cv2.imread(img_input, cv2.IMREAD_GRAYSCALE)
         else:
-            gray = img
+            # Assume it's already a numpy array (e.g. from buffer)
+            if len(img_input.shape) == 3:
+                img = cv2.cvtColor(img_input, cv2.COLOR_BGR2GRAY)
+            else:
+                img = img_input
 
-        # 1. INTELLIGENT RESIZE
-        # Standardize height to 800px to make kernel sizes consistent
-        h, w = gray.shape
+        # 1. INTELLIGENT RESIZE (Robustness)
+        # Standardize height to 800px so blur/threshold kernels work consistently
+        h, w = img.shape
         target_height = 800
         scale = target_height / h
         new_w = int(w * scale)
-        resized = cv2.resize(gray, (new_w, target_height))
+        img_resized = cv2.resize(img, (new_w, target_height))
+        
+        if debug_dir: cv2.imwrite(f"{debug_dir}/1_resized.png", img_resized)
 
-        # 2. Denoise (Bilateral is best for preserving edges)
-        denoised = cv2.bilateralFilter(resized, 9, 75, 75)
+        # 2. DENOISE (Bilateral is better than Gaussian)
+        # Bilateral filter smooths flat regions but keeps text edges crisp
+        denoised = cv2.bilateralFilter(img_resized, 9, 75, 75)
+        
+        if debug_dir: cv2.imwrite(f"{debug_dir}/2_denoised.png", denoised)
 
-        # 3. Adaptive Thresholding
-        binary = cv2.adaptiveThreshold(
-            denoised, 255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY_INV, 
-            blockSize=41, 
-            C=15
-        )
+        # 3. THRESHOLDING
+        binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 95, 17)
 
-        # 4. Morphological Cleanup (Remove tiny noise)
-        kernel = np.ones((2,2), np.uint8)
+        # 4. MORPHOLOGICAL CLEANUP (Robustness)
+        # Removes tiny specks that thresholding missed
+        kernel = np.ones((2, 2), np.uint8)
         clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # 5. Deskew (Straighten the text)
+        if debug_dir: cv2.imwrite(f"{debug_dir}/3_binarized_clean.png", clean)
+
+        # 5. DESKEWING
         coords = np.column_stack(np.where(clean > 0))
-        if len(coords) == 0: return clean, 1.0 # Empty image
-        
+        if len(coords) == 0:
+            return clean # Return empty if no text found
+
         angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45: angle = -(90 + angle)
-        else: angle = -angle
-        
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
         (h, w) = clean.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(clean, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        
-        return rotated, scale
+        rotated = cv2.warpAffine(clean, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
-    def find_and_filter_contours(self, binary_img):
+        if debug_dir: cv2.imwrite(f"{debug_dir}/4_deskewed.png", rotated)
+
+        return rotated
+
+    def find_and_filter_contours(self, binary_img, debug_dir=None):
+        """
+        ROBUST UPDATES:
+        1. Added "Minus Sign Protection" logic so thin dashes aren't deleted.
+        """
         contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if debug_dir:
+            raw_vis = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+            cv2.drawContours(raw_vis, contours, -1, (0, 0, 255), 1)
+            cv2.imwrite(f"{debug_dir}/5_raw_contours.png", raw_vis)
+
         boxes = [cv2.boundingRect(c) for c in contours]
-        
         if not boxes: return []
 
-        # --- MERGE LOGIC (Recursive) ---
+        # --- MERGE LOGIC (Iterative) ---
         while True:
             merged = False
             new_boxes = []
             skip_indices = set()
-            boxes.sort(key=lambda b: b[0]) # Sort by X
+            boxes.sort(key=lambda b: b[0])
 
             for i in range(len(boxes)):
                 if i in skip_indices: continue
@@ -107,198 +127,273 @@ class EquationSolver:
                     if j in skip_indices: continue
                     x2, y2, w2, h2 = boxes[j]
 
-                    # Overlap Checks
+                    # Overlap
                     xi1 = max(x1, x2)
                     yi1 = max(y1, y2)
                     xi2 = min(x1 + w1, x2 + w2)
                     yi2 = min(y1 + h1, y2 + h2)
                     inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-                    area1 = w1 * h1
-                    area2 = w2 * h2
+                    area1, area2 = w1 * h1, w2 * h2
                     
                     overlap_ratio = inter_area / min(area1, area2) if min(area1, area2) > 0 else 0
-                    
-                    # Vertical Stacking Check (share X-space, close Y)
+
+                    # Stacking (Vertical alignment)
                     x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-                    is_stacked = (x_overlap > 0.4 * min(w1, w2)) 
-                    
+                    is_stacked = (x_overlap > 0.4 * min(w1, w2))
+
                     if overlap_ratio > 0.5 or is_stacked:
-                        nx = min(x1, x2)
-                        ny = min(y1, y2)
+                        nx, ny = min(x1, x2), min(y1, y2)
                         nw = max(x1 + w1, x2 + w2) - nx
                         nh = max(y1 + h1, y2 + h2) - ny
                         new_boxes.append((nx, ny, nw, nh))
                         skip_indices.add(j)
                         merged = True
                         merged_this_iter = True
-                        break 
-                
+                        break
+
                 if not merged_this_iter:
                     new_boxes.append(boxes[i])
-            
+
             boxes = new_boxes
             if not merged: break
-        
-        # --- FIX: SMARTER FILTERING ---
+
+        # --- SMARTER FILTERING (Robustness) ---
         if not boxes: return []
         areas = [b[2] * b[3] for b in boxes]
         median_area = np.median(areas)
-        
+
         final_boxes = []
         for b in boxes:
             w, h = b[2], b[3]
             area = w * h
             
-            # EXCEPTION: Keep it if it looks like a minus sign
-            # Condition: Width is at least 2.5x Height (Wide and Short)
-            # AND it's not microscopic (at least 1/15th of median)
+            # EXCEPTION: Minus signs are wide and short. Don't delete them!
             is_minus_like = (w > 2.5 * h) and (area > median_area / 15)
-            
-            # Keep if standard size OR if it's a minus sign
-            if (area > median_area / 5) or is_minus_like:
+
+            # Keep if area is normal OR if it looks like a minus sign
+            if area > median_area / 5 or is_minus_like:
                 final_boxes.append(b)
-        
+
         final_boxes.sort(key=lambda b: b[0])
+
+        if debug_dir:
+            vis_box = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+            for (x,y,w,h) in final_boxes:
+                cv2.rectangle(vis_box, (x,y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.imwrite(f"{debug_dir}/6_filtered_boxes.png", vis_box)
+
         return final_boxes
 
-    def extract_and_predict(self, binary_img, boxes):
-        batch_images = []
+    def extract_and_predict(self, binary_img, boxes, debug_dir=None):
+        """
+        ROBUST UPDATES:
+        1. Implemented BATCH PREDICTION (Run all symbols at once).
+        """
         if not boxes: return []
+        
+        batch_images = []
 
-        for (x, y, w, h) in boxes:
-            # ROI
+        for i, (x, y, w, h) in enumerate(boxes):
             roi = binary_img[y:y+h, x:x+w]
-            
-            # Pad to Square
+
+            # Square Padding
             max_dim = max(w, h)
             pad_w = (max_dim - w) // 2
             pad_h = (max_dim - h) // 2
-            # Add extra padding (6px) to match MNIST-style training
-            roi = cv2.copyMakeBorder(roi, pad_h+4, pad_h+4, pad_w+4, pad_w+4, cv2.BORDER_CONSTANT, value=0)
-            
-            # Resize
-            roi = cv2.resize(roi, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-            
-            # Normalize
-            roi = roi.astype('float32') / 255.0
-            roi = np.expand_dims(roi, axis=-1)
-            batch_images.append(roi)
+            roi_padded = cv2.copyMakeBorder(roi, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_CONSTANT, value=0)
 
-        batch_input = np.array(batch_images)
-        probs = self.model.predict(batch_input, verbose=0)
-        preds = np.argmax(probs, axis=1)
-        labels = [ID_TO_LABEL[p] for p in preds]
-        return labels
+            # Resize to Model Input
+            roi_resized = cv2.resize(roi_padded, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+
+            if debug_dir:
+                cv2.imwrite(f"{debug_dir}/7_cnn_input_{i}.png", roi_resized)
+
+            # Normalize
+            roi_norm = roi_resized.astype('float32') / 255.0
+            roi_norm = np.expand_dims(roi_norm, axis=-1)
+            batch_images.append(roi_norm)
+
+        # --- BATCH PREDICT (Speed) ---
+        batch_input = np.array(batch_images) # Shape: (N, 28, 28, 1)
+        pred_probs = self.model.predict(batch_input, verbose=0)
+        pred_indices = np.argmax(pred_probs, axis=1)
+        
+        predictions = [ID_TO_LABEL[idx] for idx in pred_indices]
+        return predictions
+
+    def parse_and_solve(self, labels):
+        # ... (Same logic as before, ensure map_op is robust) ...
+        map_op = {
+            'times': '*', 'div': '/', 'plus': '+', '-': '-',
+            'pm': '+', '=': '=', 'x': 'x', 'y': 'y', 'z': 'z',
+            'pi': 'pi' # Add more if your model supports them
+        }
+
+        equation_str = ""
+        for lbl in labels:
+            if lbl in map_op:
+                equation_str += map_op[lbl]
+            else:
+                equation_str += lbl
+
+        if equation_str.endswith('='):
+            equation_str = equation_str[:-1]
+
+        print(f"Constructed String: {equation_str}")
+        transformations = (standard_transformations + (implicit_multiplication_application,))
+
+        try:
+            if '=' not in equation_str:
+                expr = parse_expr(equation_str, transformations=transformations)
+                return f"{equation_str} = {float(expr):.2f}"
+            else:
+                parts = equation_str.split('=')
+                if len(parts) != 2: return "Error: Invalid '=' usage"
+                lhs_str, rhs_str = parts
+                if not rhs_str.strip():
+                    expr = parse_expr(lhs_str, transformations=transformations)
+                    return f"{lhs_str} = {float(expr):.2f}"
+                
+                lhs = parse_expr(lhs_str, transformations=transformations)
+                rhs = parse_expr(rhs_str, transformations=transformations)
+                solution = sp.solve(lhs - rhs)
+                return f"Solution: {solution}"
+        except Exception as e:
+            return f"Error solving: {e}"
 
     def disambiguate_symbols(self, labels, boxes):
-        """Distinguish between 'x' (variable) and 'times' (multiply)"""
-        refined = list(labels)
-        if len(boxes) < 2: return refined
+        """
+        Refines predictions based on geometry (size/position) and context (neighbors).
+        Handles: 'x' vs 'times', '5' vs 's', '1' vs 'l' vs '|', '0' vs 'o'
+        """
+        if len(boxes) < 1: return labels
         
-        avg_height = np.median([b[3] for b in boxes])
+        refined = list(labels)
+        
+        # 1. Calculate Global Statistics
+        heights = [b[3] for b in boxes]
+        avg_height = np.median(heights)
+        
+        # Calculate Y-Centroids (vertical centers) for floating checks
+        centroids_y = [(b[1] + b[3] / 2) for b in boxes]
 
         for i in range(len(refined)):
             lbl = refined[i]
-            if lbl not in ['x', 'times', 'X']: continue
-            
-            _, y, _, h = boxes[i]
-            
-            # Logic: Multiplications are usually smaller OR floating
-            is_small = h < (0.75 * avg_height)
-            
-            # Check neighbors for floating status
-            neighbor = boxes[i-1] if i > 0 else (boxes[i+1] if i+1 < len(boxes) else None)
-            is_floating = False
-            if neighbor:
-                _, ny, _, nh = neighbor
-                if (y + h) < (ny + nh - 0.2 * nh): # Bottom is significantly higher
-                    is_floating = True
+            x, y, w, h = boxes[i]
+            cy = centroids_y[i] # Center Y of current box
 
-            if is_small or is_floating:
-                refined[i] = 'times'
-            else:
-                refined[i] = 'x'
+            # Identify Neighbors
+            prev_lbl = refined[i-1] if i > 0 else None
+            next_lbl = refined[i+1] if i < len(refined) - 1 else None
+            
+            # --- LOGIC GROUP 1: 'x' vs 'times' ---
+            if lbl in ['x', 'times', 'X']:
+                # Rule A: Strictly between numbers -> 'times' (e.g., "2 x 3")
+                is_between_nums = (prev_lbl and prev_lbl.isdigit()) and (next_lbl and next_lbl.isdigit())
+                
+                # Rule B: Size check (Times is usually smaller)
+                is_small = h < (0.85 * avg_height)
+                
+                # Rule C: Floating Check (Times floats above baseline)
+                # Compare my center to the average center of the whole equation (rough approx)
+                # or better, compare to neighbors if available.
+                is_floating = False
+                if prev_lbl or next_lbl:
+                    neighbor_cy = centroids_y[i-1] if prev_lbl else centroids_y[i+1]
+                    # If my center is significantly higher (smaller Y value) than neighbor
+                    if cy < (neighbor_cy - 0.1 * h): 
+                        is_floating = True
+
+                if is_between_nums:
+                    refined[i] = 'times'
+                elif is_small or is_floating:
+                    refined[i] = 'times'
+                else:
+                    refined[i] = 'x' # Default to variable if big and on baseline (e.g., "2x")
+
+            # --- LOGIC GROUP 2: '5' vs 's' ---
+            elif lbl in ['5', 's', 'S']:
+                # Rule A: Look for "sin", "cos", "sec" patterns
+                # If next is 'i' (sin) or prev is 'o' (cos), it's 's'
+                is_trig_context = (next_lbl in ['i', 'I']) or (prev_lbl in ['o', 'O', 'c', 'C'])
+                
+                # Rule B: If sandwiched by operators, it's likely 5 (e.g., "+ 5 +")
+                is_math_context = (prev_lbl in ['+', '-', '=', 'times']) or (next_lbl in ['+', '-', '=', 'times'])
+
+                if is_trig_context:
+                    refined[i] = 's'
+                elif is_math_context:
+                    refined[i] = '5'
+                # Fallback: maintain original prediction if unsure
+
+            # --- LOGIC GROUP 3: '1' vs 'l' vs '|' ---
+            elif lbl in ['1', 'l', '|', 'I', 'i']:
+                # Rule A: Absolute Value bars are usually taller than the median (e.g. |x|)
+                if h > 1.4 * avg_height:
+                    refined[i] = '|'
+                # Rule B: Logarithms (ln, log)
+                elif next_lbl in ['n', 'N', 'o', 'O']:
+                    refined[i] = 'l' # Lowercase L for log/ln
+                # Rule C: If solitary or near math, likely 1
+                else:
+                    refined[i] = '1'
+
+            # --- LOGIC GROUP 4: '0' vs 'o' ---
+            elif lbl in ['0', 'o', 'O']:
+                # Rule A: "cos", "cot", "log"
+                if prev_lbl in ['c', 'C', 'l', 'L']:
+                    refined[i] = 'o'
+                # Rule B: Math context
+                elif (prev_lbl and prev_lbl.isdigit()) or (next_lbl and next_lbl.isdigit()):
+                    refined[i] = '0'
+
         return refined
 
-    def parse_and_solve(self, labels):
-        map_op = {
-            'times': '*', 'div': '/', 'plus': '+', '-': '-', 'pm': '+', 
-            '=': '=', 'x': 'x', 'y': 'y', 'z': 'z', 'pi': 'pi',
-            'sin': 'sin', 'cos': 'cos', 'tan': 'tan', 'sqrt': 'sqrt'
-        }
-        
-        eq_str = ""
-        for lbl in labels:
-            eq_str += map_op.get(lbl, lbl)
-            
-        # Handle trailing "="
-        if eq_str.endswith('='): eq_str = eq_str[:-1]
-        
-        print(f"Solving: {eq_str}")
-        
-        transformations = (standard_transformations + (implicit_multiplication_application,))
-        
-        try:
-            if '=' not in eq_str:
-                expr = parse_expr(eq_str, transformations=transformations)
-                res = float(expr)
-                if res.is_integer(): res = int(res)
-                return eq_str, f"{res}"
-            else:
-                parts = eq_str.split('=')
-                if len(parts) != 2: return eq_str, "Error: Multiple '='"
-                lhs_str, rhs_str = parts
-                
-                if not rhs_str.strip(): # Case "2+2="
-                    expr = parse_expr(lhs_str, transformations=transformations)
-                    return lhs_str, f"{float(expr)}"
+    def run(self, image_source, output_path=None, debug=False):
+        """
+        Accepts image path OR image bytes/array.
+        """
+        debug_dir = None
+        if debug:
+            debug_dir = "debug_output"
+            os.makedirs(debug_dir, exist_ok=True)
+            print(f"Debug mode on. Saving steps to /{debug_dir}...")
 
-                lhs = parse_expr(lhs_str, transformations=transformations)
-                rhs = parse_expr(rhs_str, transformations=transformations)
-                
-                # Solve for x (or first symbol)
-                syms = lhs.free_symbols.union(rhs.free_symbols)
-                if not syms:
-                    return eq_str, str(sp.simplify(lhs - rhs) == 0)
-                
-                target = list(syms)[0]
-                sol = sp.solve(lhs - rhs, target)
-                return eq_str, f"{target} = {sol}"
-                
-        except Exception as e:
-            return eq_str, f"Math Error: {str(e)}"
+        # 1. Process
+        processed_img = self.preprocess_image(image_source, debug_dir=debug_dir)
 
-    def solve_image(self, image_buffer):
-        """Main Pipeline"""
-        if not self.model_loaded:
-            return None, "Model Error", "Check .h5 file"
-
-        # Read Image
-        file_bytes = np.asarray(bytearray(image_buffer.read()), dtype=np.uint8)
-        original = cv2.imdecode(file_bytes, 1)
-        
-        # 1. Preprocess (Deskew)
-        processed, scale = self.preprocess_image(original)
-        
         # 2. Segment
-        boxes = self.find_and_filter_contours(processed)
-        if not boxes:
-            return processed, "No Content", "Empty"
-            
-        # 3. Predict
-        labels = self.extract_and_predict(processed, boxes)
-        
-        # 4. Disambiguate
-        labels = self.disambiguate_symbols(labels, boxes)
-        
-        # 5. Solve
-        final_eq, result = self.parse_and_solve(labels)
-        
-        # 6. Visualize (Draw on the DESKEWED image)
-        vis_img = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-        for i, (x, y, w, h) in enumerate(boxes):
-            cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(vis_img, labels[i], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        boxes = self.find_and_filter_contours(processed_img, debug_dir=debug_dir)
 
-        return vis_img, final_eq, result
+        # 3. Predict
+        labels = self.extract_and_predict(processed_img, boxes, debug_dir=debug_dir)
+        
+        # --- RESTORED STEP: DISAMBIGUATE ---
+        # Refines labels (e.g., changes 'x' to 'times' based on context)
+        labels = self.disambiguate_symbols(labels, boxes)
+        # -----------------------------------
+
+        # 4. Solve
+        solution_text = self.parse_and_solve(labels)
+
+        # 5. Visualize
+        vis_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+        for i, (x, y, w, h) in enumerate(boxes):
+            # Draw box
+            cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            # Draw label
+            cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        # Draw Solution Text
+        cv2.putText(vis_img, f"Sol: {solution_text}", (10, vis_img.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+        if output_path:
+            cv2.imwrite(output_path, vis_img)
+        
+        if debug_dir:
+            cv2.imwrite(f"{debug_dir}/8_final_result.png", vis_img)
+        
+        return solution_text
+
 
