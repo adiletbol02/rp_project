@@ -38,12 +38,6 @@ class EquationSolver:
             print(f"Error loading model: {e}")
 
     def preprocess_image(self, img_input, debug_dir=None):
-        """
-        ROBUST PIPELINE:
-        1. Resizes image to 800px height (Consistency).
-        2. Bilateral Filter (Noise removal without edge blurring).
-        3. Large Block Adaptive Threshold (Fixes 'Hollow' numbers).
-        """
         # Handle input types
         if isinstance(img_input, str):
             img = cv2.imread(img_input, cv2.IMREAD_GRAYSCALE)
@@ -368,4 +362,5 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
+
 
