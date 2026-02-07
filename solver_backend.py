@@ -56,7 +56,7 @@ class EquationSolver:
         img_resized = cv2.resize(img, (new_w, target_height))
 
         # 2. DENOISE (Bilateral)
-        denoised = cv2.bilateralFilter(img_resized, 9, 75, 75)
+        denoised = cv2.bilateralFilter(img_resized, 18, 75, 75)
 
         # 3. THRESHOLDING (The Fix for Hollow Strokes)
         # BlockSize 51, C 15 ensures thick pen strokes don't turn white inside
