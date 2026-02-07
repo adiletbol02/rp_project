@@ -1,0 +1,6 @@
+# Revert Commit Message
+
+This commit reverts the changes made by commit hash: {[hash here]}.
+
+- Reverted changes for changes made after commit `8e41c30f7f54876a0c20efcc7625c154d9db6695`.
+- Additional details can be added here.
