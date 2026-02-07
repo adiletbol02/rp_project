@@ -37,8 +37,31 @@ class EquationSolver:
             self.model_loaded = False
             print(f"Error loading model: {e}")
 
-    def preprocess_image(self, img_input, debug_dir=None):
+    def preprocess_image(self, img_input, debug_dir=None, params=None):
+        # -------------------------------
+        # Defaults (CURRENT APP BEHAVIOR)
+        # -------------------------------
+        cfg = {
+            'blur_d': 9,
+            'blur_sigma': 75,
+            'thresh_block': 75,
+            'thresh_c': 31,
+            'morph_op': 'open',
+            'morph_kernel': 2,
+            'morph_iter': 1
+        }
+    
+        # Override defaults if params provided (grid search mode)
+        if params:
+            cfg.update(params)
+    
+        # Safety: adaptiveThreshold block size must be odd
+        if cfg['thresh_block'] % 2 == 0:
+            cfg['thresh_block'] += 1
+    
+        # -------------------------------
         # Handle input types
+        # -------------------------------
         if isinstance(img_input, str):
             img = cv2.imread(img_input, cv2.IMREAD_GRAYSCALE)
         else:
@@ -46,67 +69,95 @@ class EquationSolver:
                 img = cv2.cvtColor(img_input, cv2.COLOR_BGR2GRAY)
             else:
                 img = img_input
-
+    
+        # -------------------------------
         # 1. INTELLIGENT RESIZE
-        # We resize height to 800px so our kernel sizes (51, 15) always behave the same
+        # -------------------------------
         h, w = img.shape
         target_height = 800
         scale = target_height / h
         new_w = int(w * scale)
         img_resized = cv2.resize(img, (new_w, target_height))
-
+    
+        # -------------------------------
         # 2. DENOISE (Bilateral)
-        denoised = cv2.bilateralFilter(img_resized, 9, 75, 75)
-
-        # 3. THRESHOLDING (The Fix for Hollow Strokes)
-        # BlockSize 51, C 15 ensures thick pen strokes don't turn white inside
-        binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 75, 31)
-
+        # -------------------------------
+        denoised = cv2.bilateralFilter(
+            img_resized,
+            cfg['blur_d'],
+            cfg['blur_sigma'],
+            cfg['blur_sigma']
+        )
+    
+        # -------------------------------
+        # 3. ADAPTIVE THRESHOLD
+        # -------------------------------
+        binary = cv2.adaptiveThreshold(
+            denoised,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            cfg['thresh_block'],
+            cfg['thresh_c']
+        )
+    
+        # -------------------------------
         # 4. MORPHOLOGICAL CLEANUP
-        kernel = np.ones((2, 2), np.uint8)
-        clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-
-
-        
-
+        # -------------------------------
+        kernel = np.ones((cfg['morph_kernel'], cfg['morph_kernel']), np.uint8)
+    
+        morph_flag = (
+            cv2.MORPH_CLOSE if cfg['morph_op'] == 'close'
+            else cv2.MORPH_OPEN
+        )
+    
+        clean = cv2.morphologyEx(
+            binary,
+            morph_flag,
+            kernel,
+            iterations=cfg['morph_iter']
+        )
+    
+        # -------------------------------
+        # 5. FILTER SMALL BLOBS (unchanged)
+        # -------------------------------
         contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return clean
-
+        if not contours:
+            return clean
+    
         initial_boxes = [cv2.boundingRect(c) for c in contours]
         areas = [b[2] * b[3] for b in initial_boxes]
         top_3_area = np.mean(sorted(areas, reverse=True)[:3])
-
-        # Create a mask to keep only significant blobs
+    
         clean_mask = np.zeros_like(clean)
         for i, b in enumerate(initial_boxes):
             area = b[2] * b[3]
-            # If it's big enough, draw it onto our clean mask
             if area > (top_3_area / 15) or (b[2] > 2.5 * b[3] and area > top_3_area / 20):
                 cv2.drawContours(clean_mask, contours, i, 255, -1)
-
-
-        
-
-        # 5. DESKEWING
+    
+        # -------------------------------
+        # 6. DESKEWING (unchanged)
+        # -------------------------------
         coords = np.column_stack(np.where(clean_mask > 0))
         if len(coords) == 0:
-            return clean_mask # Return empty if no text found
-
+            return clean_mask
+    
         angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-
-        (h, w) = clean_mask.shape[:2]
+        angle = -(90 + angle) if angle < -45 else -angle
+    
+        h, w = clean_mask.shape
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(clean_mask, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-        if debug_dir: cv2.imwrite(f"{debug_dir}/4_deskewed.png", rotated)
-
+        rotated = cv2.warpAffine(
+            clean_mask,
+            M,
+            (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+    
         return rotated
+
 
     def find_and_filter_contours(self, clean_binary, debug_dir=None):
         """
@@ -387,6 +438,7 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
+
 
 
 
