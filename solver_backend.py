@@ -56,15 +56,15 @@ class EquationSolver:
         img_resized = cv2.resize(img, (new_w, target_height))
 
         # 2. DENOISE (Bilateral)
-        denoised = cv2.bilateralFilter(img_resized, 11, 75, 75)
+        denoised = cv2.bilateralFilter(img_resized, 18, 75, 75)
 
         # 3. THRESHOLDING (The Fix for Hollow Strokes)
         # BlockSize 51, C 15 ensures thick pen strokes don't turn white inside
         binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 71, 15)
+                                       cv2.THRESH_BINARY_INV, 71, 10)
 
         # 4. MORPHOLOGICAL CLEANUP
-        kernel = np.ones((3, 3), np.uint8)
+        kernel = np.ones((2, 2), np.uint8)
         clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
         # 5. DESKEWING
@@ -86,17 +86,40 @@ class EquationSolver:
         return rotated
 
     def find_and_filter_contours(self, binary_img):
+        # 1. Initial Contours
         contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = [cv2.boundingRect(c) for c in contours]
+        initial_boxes = [cv2.boundingRect(c) for c in contours]
         
-        if not boxes: return []
+        if not initial_boxes: 
+            return []
 
-        # --- MERGE LOGIC ---
+        # 2. Pre-filter tiny blobs (Noise reduction)
+        # This prevents tiny dust from being counted in the 'Top 4'
+        filtered_boxes = [b for b in initial_boxes if (b[2] * b[3]) > 10] 
+        if not filtered_boxes: return []
+
+        # 3. Define average size by Top 4 largest blobs
+        filtered_boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+        top_4_boxes = filtered_boxes[:4]
+        avg_top_area = np.mean([b[2] * b[3] for b in top_4_boxes])
+        
+        # 4. Refined Filtering Logic
+        # Keep boxes if they are large enough OR look like a minus sign
+        boxes = []
+        for b in filtered_boxes:
+            w, h = b[2], b[3]
+            area = w * h
+            is_minus_like = (w > 2.2 * h) and (area > avg_top_area / 20)
+            
+            if area > (avg_top_area / 10) or is_minus_like:
+                boxes.append(b)
+
+        # 5. --- VERTICAL & OVERLAP MERGE ---
         while True:
             merged = False
             new_boxes = []
             skip_indices = set()
-            boxes.sort(key=lambda b: b[0])
+            boxes.sort(key=lambda b: b[0]) # Sort Left to Right
 
             for i in range(len(boxes)):
                 if i in skip_indices: continue
@@ -107,49 +130,32 @@ class EquationSolver:
                     if j in skip_indices: continue
                     x2, y2, w2, h2 = boxes[j]
 
-                    # Overlap Checks
+                    # Overlap calculation
                     xi1, yi1 = max(x1, x2), max(y1, y2)
                     xi2, yi2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
                     inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-                    area1, area2 = w1 * h1, w2 * h2
                     
-                    overlap_ratio = inter_area / min(area1, area2) if min(area1, area2) > 0 else 0
-                    
-                    # Vertical Stacking Check
+                    # Vertical Stacking Check (e.g., dots on 'i' or '=' signs)
                     x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-                    is_stacked = (x_overlap > 0.4 * min(w1, w2))
+                    is_stacked = (x_overlap > 0.5 * min(w1, w2))
 
-                    if overlap_ratio > 0.5 or is_stacked:
+                    if (inter_area > 0) or is_stacked:
                         nx, ny = min(x1, x2), min(y1, y2)
                         nw, nh = max(x1 + w1, x2 + w2) - nx, max(y1 + h1, y2 + h2) - ny
-                        new_boxes.append((nx, ny, nw, nh))
+                        
+                        # Update current box dimensions to the merged one
+                        x1, y1, w1, h1 = nx, ny, nw, nh
                         skip_indices.add(j)
                         merged = True
                         merged_this_iter = True
-                        break
 
-                if not merged_this_iter:
-                    new_boxes.append(boxes[i])
+                new_boxes.append((x1, y1, w1, h1))
 
             boxes = new_boxes
             if not merged: break
 
-        # --- FILTERING LOGIC ---
-        areas = [b[2] * b[3] for b in boxes]
-        median_area = np.median(areas)
-        final_boxes = []
-        
-        for b in boxes:
-            w, h = b[2], b[3]
-            area = w * h
-            # Robustness: Don't delete wide, thin lines (Minus signs)
-            is_minus_like = (w > 2.5 * h) and (area > median_area / 15)
-            
-            if area > median_area / 5 or is_minus_like:
-                final_boxes.append(b)
-
-        final_boxes.sort(key=lambda b: b[0])
-        return final_boxes
+        boxes.sort(key=lambda b: b[0])
+        return boxes
 
     def extract_and_predict(self, binary_img, boxes):
         if not boxes: return []
