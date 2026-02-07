@@ -37,95 +37,40 @@ class EquationSolver:
             self.model_loaded = False
             print(f"Error loading model: {e}")
 
-    def preprocess_image(self, img_input, params=None, debug_dir=None):
-        # Default robust parameters (You can override these via the 'params' argument)
-        cfg = {
-            'target_height': 800,       # Fixed height for consistency
-            'blur_d': 9,                # Bilateral filter diameter
-            'blur_sigma': 75,           # Bilateral filter color/space sigma
-            'thresh_block': 31,         # Block size for adaptive threshold (must be odd)
-            'thresh_c': 8,             # Constant subtracted from mean (The "Sensitivity" knob)
-            'morph_op': 'open',        # 'open' removes noise, 'close' fills gaps (safer for thin lines)
-            'morph_kernel': 2,          # Size of the morphological kernel
-            'morph_iter': 1             # Number of times to run morphology
-        }
-        if params:
-            cfg.update(params)
-
-
-        # Handle input: if string, load path. If array, use directly.
+    def preprocess_image(self, img_input, debug_dir=None):
+        # Handle input types
         if isinstance(img_input, str):
             img = cv2.imread(img_input, cv2.IMREAD_GRAYSCALE)
         else:
-            # Assume it's already a numpy array (e.g. from buffer)
             if len(img_input.shape) == 3:
                 img = cv2.cvtColor(img_input, cv2.COLOR_BGR2GRAY)
             else:
                 img = img_input
 
-        # 1. INTELLIGENT RESIZE (Robustness)
-        # Standardize height to 800px so blur/threshold kernels work consistently
+        # 1. INTELLIGENT RESIZE
+        # We resize height to 800px so our kernel sizes (51, 15) always behave the same
         h, w = img.shape
-        scale = cfg['target_height'] / h
+        target_height = 800
+        scale = target_height / h
         new_w = int(w * scale)
-        img_resized = cv2.resize(img, (new_w, cfg['target_height']))
+        img_resized = cv2.resize(img, (new_w, target_height))
 
-        if debug_dir: cv2.imwrite(f"{debug_dir}/1_resized.png", img_resized)
+        # 2. DENOISE (Bilateral)
+        denoised = cv2.bilateralFilter(img_resized, 11, 75, 75)
 
-        # 2. DENOISE (Bilateral is better than Gaussian)
-        # Bilateral filter smooths flat regions but keeps text edges crisp
-        denoised = cv2.bilateralFilter(img_resized, cfg['blur_d'], cfg['blur_sigma'], cfg['blur_sigma'])
+        # 3. THRESHOLDING (The Fix for Hollow Strokes)
+        # BlockSize 51, C 15 ensures thick pen strokes don't turn white inside
+        binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 71, 15)
 
-        if debug_dir: cv2.imwrite(f"{debug_dir}/2_denoised.png", denoised)
-
-        # 3. THRESHOLDING
-        binary = cv2.adaptiveThreshold(
-            denoised,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            cfg['thresh_block'],
-            cfg['thresh_c']
-        )
-
-        # 4. MORPHOLOGICAL CLEANUP (Robustness)
-        # Removes tiny specks that thresholding missed
-        kernel = np.ones((cfg['morph_kernel'], cfg['morph_kernel']), np.uint8)
-
-        if cfg['morph_op'] == 'open':
-            clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=cfg['morph_iter'])
-        elif cfg['morph_op'] == 'close':
-            clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=cfg['morph_iter'])
-        else:
-            clean = binary
-
-        if debug_dir: cv2.imwrite(f"{debug_dir}/3_binarized_clean.png", clean)
-
-
-
-
-        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return clean
-
-        initial_boxes = [cv2.boundingRect(c) for c in contours]
-        areas = [b[2] * b[3] for b in initial_boxes]
-        top_3_area = np.mean(sorted(areas, reverse=True)[:3])
-
-        # Create a mask to keep only significant blobs
-        clean_mask = np.zeros_like(clean)
-        for i, b in enumerate(initial_boxes):
-            area = b[2] * b[3]
-            # If it's big enough, draw it onto our clean mask
-            if area > (top_3_area / 15) or (b[2] > 2.5 * b[3] and area > top_3_area / 20):
-                cv2.drawContours(clean_mask, contours, i, 255, -1)
-
-
-        
+        # 4. MORPHOLOGICAL CLEANUP
+        kernel = np.ones((3, 3), np.uint8)
+        clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
         # 5. DESKEWING
-        coords = np.column_stack(np.where(clean_mask > 0))
+        coords = np.column_stack(np.where(clean > 0))
         if len(coords) == 0:
-            return clean_mask # Return empty if no text found
+            return clean # Return empty if no text found
 
         angle = cv2.minAreaRect(coords)[-1]
         if angle < -45:
@@ -133,36 +78,24 @@ class EquationSolver:
         else:
             angle = -angle
 
-        (h, w) = clean_mask.shape[:2]
+        (h, w) = clean.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(clean_mask, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-        if debug_dir: cv2.imwrite(f"{debug_dir}/4_deskewed.png", rotated)
+        rotated = cv2.warpAffine(clean, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
         return rotated
 
-
-    def find_and_filter_contours(self, clean_binary, debug_dir=None):
-        """
-        Input is already noise-filtered and deskewed.
-        Goal: Group related blobs (like '=' or 'i') into single character boxes.
-        """
-        # 1. Get contours from the cleaned image
-        contours, _ = cv2.findContours(clean_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def find_and_filter_contours(self, binary_img):
+        contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         boxes = [cv2.boundingRect(c) for c in contours]
         
-        if not boxes: 
-            return []
+        if not boxes: return []
 
-        # 2. ITERATIVE MERGE LOGIC
-        # We must group vertically stacked parts (equals signs, division dots, 'i' dots)
+        # --- MERGE LOGIC ---
         while True:
             merged = False
             new_boxes = []
             skip_indices = set()
-            
-            # Sort Left-to-Right to make neighbor checking predictable
             boxes.sort(key=lambda b: b[0])
 
             for i in range(len(boxes)):
@@ -174,26 +107,21 @@ class EquationSolver:
                     if j in skip_indices: continue
                     x2, y2, w2, h2 = boxes[j]
 
-                    # A. Vertical Stacking Check (Crucial for '=' and 'i')
-                    # Calculate horizontal overlap
-                    x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-                    # If they share 40% of their width, they are likely part of the same char
-                    is_stacked = (x_overlap > 0.4 * min(w1, w2))
-
-                    # B. Tight Overlap Check (In case blobs touch or intersect)
+                    # Overlap Checks
                     xi1, yi1 = max(x1, x2), max(y1, y2)
                     xi2, yi2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
                     inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-                    union_area = (w1 * h1) + (w2 * h2) - inter_area
-                    iou = inter_area / union_area if union_area > 0 else 0
+                    area1, area2 = w1 * h1, w2 * h2
+                    
+                    overlap_ratio = inter_area / min(area1, area2) if min(area1, area2) > 0 else 0
+                    
+                    # Vertical Stacking Check
+                    x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+                    is_stacked = (x_overlap > 0.4 * min(w1, w2))
 
-                    if is_stacked or iou > 0.3:
-                        # Create the new bounding box that encompasses both
-                        nx = min(x1, x2)
-                        ny = min(y1, y2)
-                        nw = max(x1 + w1, x2 + w2) - nx
-                        nh = max(y1 + h1, y2 + h2) - ny
-                        
+                    if overlap_ratio > 0.5 or is_stacked:
+                        nx, ny = min(x1, x2), min(y1, y2)
+                        nw, nh = max(x1 + w1, x2 + w2) - nx, max(y1 + h1, y2 + h2) - ny
                         new_boxes.append((nx, ny, nw, nh))
                         skip_indices.add(j)
                         merged = True
@@ -204,12 +132,24 @@ class EquationSolver:
                     new_boxes.append(boxes[i])
 
             boxes = new_boxes
-            if not merged: 
-                break
+            if not merged: break
 
-        # Final sort ensures your equation string (e.g., "2+2") is in the right order
-        boxes.sort(key=lambda b: b[0])
-        return boxes
+        # --- FILTERING LOGIC ---
+        areas = [b[2] * b[3] for b in boxes]
+        median_area = np.median(areas)
+        final_boxes = []
+        
+        for b in boxes:
+            w, h = b[2], b[3]
+            area = w * h
+            # Robustness: Don't delete wide, thin lines (Minus signs)
+            is_minus_like = (w > 2.5 * h) and (area > median_area / 15)
+            
+            if area > median_area / 5 or is_minus_like:
+                final_boxes.append(b)
+
+        final_boxes.sort(key=lambda b: b[0])
+        return final_boxes
 
     def extract_and_predict(self, binary_img, boxes):
         if not boxes: return []
@@ -422,11 +362,6 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
-
-
-
-
-
 
 
 
