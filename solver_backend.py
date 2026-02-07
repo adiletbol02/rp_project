@@ -44,8 +44,8 @@ class EquationSolver:
             'blur_d': 9,                # Bilateral filter diameter
             'blur_sigma': 75,           # Bilateral filter color/space sigma
             'thresh_block': 31,         # Block size for adaptive threshold (must be odd)
-            'thresh_c': 5,             # Constant subtracted from mean (The "Sensitivity" knob)
-            'morph_op': 'close',        # 'open' removes noise, 'close' fills gaps (safer for thin lines)
+            'thresh_c': 8,             # Constant subtracted from mean (The "Sensitivity" knob)
+            'morph_op': 'open',        # 'open' removes noise, 'close' fills gaps (safer for thin lines)
             'morph_kernel': 2,          # Size of the morphological kernel
             'morph_iter': 1             # Number of times to run morphology
         }
@@ -422,6 +422,7 @@ class EquationSolver:
             cv2.putText(vis_img, labels[i], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return vis_img, final_eq, result
+
 
 
 
